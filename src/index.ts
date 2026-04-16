@@ -92,7 +92,7 @@ function extractEmailContent(messagePart: GmailMessagePart): EmailContent {
 /**
  * Extract common headers from Gmail message payload
  */
-function extractHeaders(payload: any): { subject: string; from: string; to: string; date: string; rfcMessageId: string } {
+function extractHeaders(payload: any): { subject: string; from: string; to: string; cc: string; bcc: string; date: string; rfcMessageId: string } {
     const headers = payload?.headers || [];
     const getHeader = (name: string) =>
         headers.find((h: any) => h.name?.toLowerCase() === name.toLowerCase())?.value || "";
@@ -100,6 +100,8 @@ function extractHeaders(payload: any): { subject: string; from: string; to: stri
         subject: getHeader("subject"),
         from: getHeader("from"),
         to: getHeader("to"),
+        cc: getHeader("cc"),
+        bcc: getHeader("bcc"),
         date: getHeader("date"),
         rfcMessageId: getHeader("message-id"),
     };
@@ -535,7 +537,7 @@ async function main() {
                         format: 'full',
                     });
 
-                    const { subject, from, to, date, rfcMessageId } = extractHeaders(response.data.payload);
+                    const { subject, from, to, cc, bcc, date, rfcMessageId } = extractHeaders(response.data.payload);
                     const threadId = response.data.threadId || '';
                     const { text, html } = extractEmailContent(response.data.payload as GmailMessagePart || {});
                     const attachments = extractAttachments(response.data.payload as GmailMessagePart);
@@ -554,7 +556,7 @@ async function main() {
                         content: [
                             {
                                 type: "text",
-                                text: `Thread ID: ${threadId}\nMessage-ID: ${rfcMessageId}\nSubject: ${subject}\nFrom: ${from}\nTo: ${to}\nDate: ${date}\n\n${contentTypeNote}${body}${attachmentInfo}`,
+                                text: `Thread ID: ${threadId}\nMessage-ID: ${rfcMessageId}\nSubject: ${subject}\nFrom: ${from}\nTo: ${to}${cc ? `\nCC: ${cc}` : ''}${bcc ? `\nBCC: ${bcc}` : ''}\nDate: ${date}\n\n${contentTypeNote}${body}${attachmentInfo}`,
                             },
                         ],
                     };
