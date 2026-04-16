@@ -58,6 +58,9 @@ user-invocable: false
 
 **Why not manual close:** "Closed" (red) looks like rejection to contributors and doesn't credit their work on their GitHub profile. Always use `gh pr merge` for accepted PRs.
 
+**Post-merge integration test (mandatory for feature PRs):**
+After merging a PR that adds new tools or features, rebuild from source (`npm run build`) and test the actual new functionality end-to-end. Do NOT simulate by using existing tools that happen to call the same API — test the actual new code path. For new MCP tools: rebuild, then invoke the tool via the local MCP server or direct `node` execution to verify it returns correct data.
+
 **If `gh pr merge` can't be used (conflicts):** Merge locally, resolve conflicts, push to the target branch. GitHub will auto-detect the PR as merged when the PR's head commit appears in the target branch history. Leave the PR open (don't close manually) — let GitHub close it automatically with the purple badge.
 
 ## Staleness Policy
