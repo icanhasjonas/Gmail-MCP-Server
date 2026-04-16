@@ -27,10 +27,11 @@ user-invocable: false
 - Check for labels: "help wanted", "needs help", "good first issue", etc.
 - If "help wanted" / "needs help": assess if anyone volunteered, if PR is stale, if requested help was provided.
 
-### Step 3: Security Audit (Mandatory, Before Presenting)
-- Run comprehensive security audit on EVERY PR using `security-auditor` subagent.
+### Step 3: Security Audit (Conditional)
+- **Skip security audit for PRs with "help wanted" label that are still waiting for community testing/volunteers.** These PRs are parked — auditing them wastes resources. Report a one-liner instead: "PR #N: still waiting for community help, no action needed."
+- For all other PRs: run comprehensive security audit using `security-auditor` subagent.
 - Explicitly report verdict: "Security audit: **PASS**" or "Security audit: **FAIL** — [findings]"
-- Never present a PR review to user without a completed security audit.
+- Never present a PR review to user without a completed security audit (unless skipped per above).
 - For FAIL verdicts: list all findings with severity (CRITICAL/HIGH/MEDIUM/LOW/INFO).
 - **Local MCP threat model:** This is a local stdio MCP server (user self-hosts on own PC, not remote/hosted). The LLM client already has full filesystem/shell access. Path traversal, filename injection, and local XSS are NOT security issues in this context — the "attacker" (LLM) already has more powerful tools (Bash, Write). Only flag issues that represent actual risk in the local threat model (e.g., credential leaks to third parties, network-exposed endpoints, dependency supply chain). Do NOT flag local filesystem operations as security vulnerabilities.
 
@@ -41,6 +42,7 @@ user-invocable: false
 
 ### Step 5: Present Findings
 - Each PR gets: security verdict, comment summary, label status, code review findings, recommendation (approve/request changes/close).
+- **All tables (PRs and issues) MUST include the author/opener name.** Never omit who created the PR or issue — the user needs this for context.
 
 ## Merge Flow (When Approving)
 
