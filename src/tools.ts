@@ -3,6 +3,15 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 
 // Schema definitions
 
+// Shared by send_email, draft_email and update_draft. A bare address is sent
+// with no display name (Gmail does not fill in the alias's name), so say so.
+const FROM_DESCRIPTION =
+  "Sender, as `email` or `Display Name <email>` (e.g. `Jane Doe <jane@example.com>`). " +
+  "Quote the name if it contains a comma or period: `\"Doe, Jane\" <jane@example.com>`. " +
+  "The address must be a configured send-as alias in Gmail settings. " +
+  "A bare address is sent with no display name, so pass the name to show one. " +
+  "Defaults to the account's default send-as address.";
+
 // Inline image embedded in an HTML body and referenced via a cid: URL.
 // Exactly one of `path` / `content` must be set; `contentType` is required with `content`.
 export const InlineImageSchema = z.object({
@@ -25,7 +34,7 @@ export const SendEmailSchema = z.object({
   to: z.array(z.string()).describe("List of recipient email addresses"),
   subject: z.string().describe("Email subject"),
   body: z.string().describe("Email body content (used for text/plain or when htmlBody not provided)"),
-  from: z.string().optional().describe("Sender email address (must be a configured send-as alias in Gmail settings). Defaults to account's default send-as address if not specified."),
+  from: z.string().optional().describe(FROM_DESCRIPTION),
   htmlBody: z.string().optional().describe("HTML version of the email body"),
   mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
   cc: z.array(z.string()).optional().describe("List of CC recipients"),
@@ -70,7 +79,7 @@ export const UpdateDraftSchema = z.object({
   to: z.array(z.string()).describe("List of recipient email addresses"),
   subject: z.string().describe("Email subject"),
   body: z.string().describe("Email body content (used for text/plain or when htmlBody not provided)"),
-  from: z.string().optional().describe("Sender email address (must be a configured send-as alias in Gmail settings). Defaults to account's default send-as address if not specified."),
+  from: z.string().optional().describe(FROM_DESCRIPTION),
   htmlBody: z.string().optional().describe("HTML version of the email body"),
   mimeType: z.enum(['text/plain', 'text/html', 'multipart/alternative']).optional().default('text/plain').describe("Email content type"),
   cc: z.array(z.string()).optional().describe("List of CC recipients"),
