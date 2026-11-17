@@ -3,14 +3,20 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 
 // Schema definitions
 
-// Shared by send_email, draft_email and update_draft. A bare address is sent
-// with no display name (Gmail does not fill in the alias's name), so say so.
+// `from` and `to` descriptions, shared by send_email, draft_email, update_draft
+// and forward_email. They differ on purpose: a bare `from` address is sent with
+// no display name (Gmail does not fill in the alias's name), while `to` goes
+// through validateEmail(), which rejects anything containing whitespace.
 const FROM_DESCRIPTION =
   "Sender, as `email` or `Display Name <email>` (e.g. `Jane Doe <jane@example.com>`). " +
   "Quote the name if it contains a comma or period: `\"Doe, Jane\" <jane@example.com>`. " +
   "The address must be a configured send-as alias in Gmail settings. " +
   "A bare address is sent with no display name, so pass the name to show one. " +
   "Defaults to the account's default send-as address.";
+
+const TO_DESCRIPTION =
+  "Recipient email addresses, bare only (e.g. `jane@example.com`). " +
+  "Unlike `from`, `Display Name <email>` is rejected here.";
 
 // Inline image embedded in an HTML body and referenced via a cid: URL.
 // Exactly one of `path` / `content` must be set; `contentType` is required with `content`.
@@ -31,7 +37,7 @@ export const InlineImageSchema = z.object({
   });
 
 export const SendEmailSchema = z.object({
-  to: z.array(z.string()).describe("List of recipient email addresses"),
+  to: z.array(z.string()).describe(TO_DESCRIPTION),
   subject: z.string().describe("Email subject"),
   body: z.string().describe("Email body content (used for text/plain or when htmlBody not provided)"),
   from: z.string().optional().describe(FROM_DESCRIPTION),
@@ -74,9 +80,14 @@ export const DeleteDraftSchema = z.object({
   draftId: z.string().describe("ID of the draft to delete"),
 });
 
+export const ListDraftsSchema = z.object({
+  maxResults: z.number().int().min(1).max(100).optional().default(50).describe("Maximum number of drafts to return (1-100, default: 50)"),
+  query: z.string().optional().describe("Gmail search query to filter drafts (e.g., 'subject:invoice'). Omit to list all drafts."),
+});
+
 export const UpdateDraftSchema = z.object({
   draftId: z.string().describe("ID of the draft to update"),
-  to: z.array(z.string()).describe("List of recipient email addresses"),
+  to: z.array(z.string()).describe(TO_DESCRIPTION),
   subject: z.string().describe("Email subject"),
   body: z.string().describe("Email body content (used for text/plain or when htmlBody not provided)"),
   from: z.string().optional().describe(FROM_DESCRIPTION),
@@ -227,6 +238,18 @@ export const ReplyAllSchema = z.object({
   inlineImages: z.array(InlineImageSchema).optional().describe("Images embedded inline in the HTML body, each referenced from htmlBody as <img src=\"cid:CID\">. Requires htmlBody to be set."),
 });
 
+// Forward schema - fetches the original email and re-sends it to new recipients
+export const ForwardEmailSchema = z.object({
+  messageId: z.string().describe("ID of the email message to forward"),
+  to: z.array(z.string()).describe(TO_DESCRIPTION),
+  cc: z.array(z.string()).optional().describe("List of CC recipients"),
+  bcc: z.array(z.string()).optional().describe("List of BCC recipients"),
+  from: z.string().optional().describe(FROM_DESCRIPTION),
+  body: z.string().optional().describe("Optional note placed above the quoted original message"),
+  htmlBody: z.string().optional().describe("HTML version of the optional note. Only used when the original message has an HTML body."),
+  includeAttachments: z.boolean().optional().default(true).describe("Carry the original message's attachments and inline images over to the forwarded copy"),
+});
+
 // Tool definition type
 export interface ToolAnnotations {
   title: string;
@@ -341,6 +364,13 @@ export const toolDefinitions: ToolDefinition[] = [
     schema: UpdateDraftSchema,
     scopes: ["gmail.modify", "gmail.compose"],
     annotations: { title: "Update Draft", destructiveHint: false },
+  },
+  {
+    name: "list_drafts",
+    description: "Lists existing drafts, returning each draft's draft ID plus the subject, To and snippet of its message. Use this to find the draftId required by send_draft, delete_draft and update_draft for drafts that were not created in the current session.",
+    schema: ListDraftsSchema,
+    scopes: ["gmail.readonly", "gmail.modify", "gmail.compose"],
+    annotations: { title: "List Drafts", readOnlyHint: true },
   },
   {
     name: "modify_email",
@@ -467,6 +497,15 @@ export const toolDefinitions: ToolDefinition[] = [
     scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
     annotations: { title: "Reply All", destructiveHint: false },
   },
+
+  // Forward operation
+  {
+    name: "forward_email",
+    description: "Forwards an existing email to new recipients. Fetches the original message, prepends the standard 'Forwarded message' header block, and carries attachments and inline images over by default.",
+    schema: ForwardEmailSchema,
+    scopes: ["gmail.modify", "gmail.compose", "gmail.send"],
+    annotations: { title: "Forward Email", destructiveHint: false },
+  },
 ];
 
 /**
@@ -494,7 +533,9 @@ function toJsonSchemaCached(schema: z.ZodType<any>) {
   const cached = jsonSchemaCache.get(schema);
   if (cached) return cached;
 
-  const converted = zodToJsonSchema(schema);
+  // zod-to-json-schema >=3.25 types its param from "zod/v3"; comparing that to
+  // our "zod" ZodType recurses until tsc gives up (TS2589). Same runtime class.
+  const converted = zodToJsonSchema(schema as unknown as Parameters<typeof zodToJsonSchema>[0]);
   jsonSchemaCache.set(schema, converted);
   return converted;
 }

@@ -18,11 +18,14 @@ import {createEmailMessage, createEmailWithNodemailer, needsRawBuilder} from "./
 import { createLabel, updateLabel, deleteLabel, listLabels, findLabelByName, getOrCreateLabel, GmailLabel } from "./label-manager.js";
 import { createFilter, listFilters, getFilter, deleteFilter, filterTemplates, GmailFilterCriteria, GmailFilterAction } from "./filter-manager.js";
 import { parseEmailAddresses, filterOutEmail, addRePrefix, buildReferencesHeader, buildReplyAllRecipients } from "./reply-all-helpers.js";
+import { addFwdPrefix, collectForwardAttachments, assertForwardAttachmentsWithinLimit, buildForwardedTextBody, buildForwardedHtmlBody } from "./forward-helpers.js";
 import { DEFAULT_SCOPES, scopeNamesToUrls, parseScopes, validateScopes, hasScope, getAvailableScopeNames } from "./scopes.js";
-import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema } from "./tools.js";
+import { toolDefinitions, toMcpTools, getToolByName, SendEmailSchema, ReadEmailSchema, SearchEmailsSchema, ModifyEmailSchema, DeleteEmailSchema, BatchModifyEmailsSchema, ReportPhishingSchema, BatchReportPhishingSchema, BatchDeleteEmailsSchema, CreateLabelSchema, UpdateLabelSchema, DeleteLabelSchema, GetOrCreateLabelSchema, CreateFilterSchema, GetFilterSchema, DeleteFilterSchema, CreateFilterFromTemplateSchema, DownloadAttachmentSchema, ReplyAllSchema, GetThreadSchema, ListInboxThreadsSchema, GetInboxWithThreadsSchema, DownloadEmailSchema, ModifyThreadSchema, SendDraftSchema, DeleteDraftSchema, UpdateDraftSchema, ForwardEmailSchema, ListDraftsSchema } from "./tools.js";
 import { gmailMessageToJson, emailToTxt, emailToHtml, EmailAttachment } from "./email-export.js";
 import { isHttpRequested } from "./http-flag.js";
 import { resolveToolPrefix } from "./tool-prefix.js";
+import { runDoctorCli } from "./auth-doctor.js";
+import { listenLoopback, isPrimaryBindMissing, portOwnerHint } from "./auth-listener.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -116,6 +119,25 @@ function extractHeaders(payload: any): { subject: string; from: string; to: stri
         date: getHeader("date"),
         rfcMessageId: getHeader("message-id"),
     };
+}
+
+// Most filesystems cap filenames at 255 bytes. Gmail attachment IDs for larger
+// attachments can be ~500 chars, so a fallback name like `attachment-<id>`
+// would exceed that and fail with ENAMETOOLONG on write.
+const MAX_FILENAME_LENGTH = 200;
+
+function sanitizeFilename(filename: string): string {
+    let name = path.basename(filename);
+    if (Buffer.byteLength(name) <= MAX_FILENAME_LENGTH) {
+        return name;
+    }
+    const ext = path.extname(name);
+    const stem = name.slice(0, MAX_FILENAME_LENGTH - Buffer.byteLength(ext));
+    return stem + ext;
+}
+
+function fallbackAttachmentName(attachmentId: string): string {
+    return sanitizeFilename(`attachment-${attachmentId.slice(0, 16)}`);
 }
 
 /**
@@ -239,7 +261,6 @@ async function loadCredentials() {
 }
 
 async function authenticate(scopes: string[]) {
-    const server = http.createServer();
     // Port derivation:
     // - explicit port in the callback URL -> use it
     // - portless http -> protocol default 80 (NOT 3000 — that fallback caused
@@ -249,10 +270,69 @@ async function authenticate(scopes: string[]) {
     const port = callbackUrl.port
         ? Number(callbackUrl.port)
         : (callbackUrl.protocol === 'https:' ? 3000 : 80);
-    server.listen(port, '127.0.0.1');
 
     // Convert shorthand scope names (e.g., "gmail.readonly") to full Google API URLs
     const scopeUrls = scopeNamesToUrls(scopes);
+
+    // Executor form, not Promise.withResolvers: the package supports
+    // node >=14 and withResolvers landed in Node 22.
+    let callbackDone!: () => void;
+    let callbackFailed!: (error: Error) => void;
+    const callbackHandled = new Promise<void>((resolve, reject) => {
+        callbackDone = resolve;
+        callbackFailed = reject;
+    });
+    const onRequest: http.RequestListener = async (req, res) => {
+        if (!req.url?.startsWith(callbackUrl.pathname)) return;
+
+        const url = new URL(req.url, callbackUrl.origin);
+        const code = url.searchParams.get('code');
+
+        if (!code) {
+            res.writeHead(400);
+            res.end('No code provided');
+            callbackFailed(new Error('No code provided'));
+            return;
+        }
+
+        try {
+            const { tokens } = await oauth2Client.getToken(code);
+            oauth2Client.setCredentials(tokens);
+
+            // Store both tokens and authorized scopes for runtime filtering
+            const credentials = { tokens, scopes };
+            fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(credentials, null, 2), { mode: 0o600 });
+
+            res.writeHead(200);
+            res.end('Authentication successful! You can close this window.');
+            console.log('Credentials written to:', CREDENTIALS_PATH);
+            console.log('Scopes granted:', scopes.join(', '));
+            console.log('Note: restart any running MCP clients — servers started before this re-auth keep the old refresh token in memory.');
+            callbackDone();
+        } catch (error) {
+            res.writeHead(500);
+            res.end('Authentication failed');
+            callbackFailed(error as Error);
+        }
+    };
+
+    // Bind every loopback stack the consent URL can land on. `localhost`
+    // resolves to IPv6 `::1` in most browsers, so a 127.0.0.1-only listener
+    // silently loses the callback whenever another process owns [::1]:port.
+    const listener = await listenLoopback(port, onRequest);
+    const fatalFailures = listener.failures.filter(({ host }) => host === '127.0.0.1');
+    if (isPrimaryBindMissing(listener)) {
+        const busy = fatalFailures.map(({ host, error }) => `${host}: ${error.code ?? error.message}`).join('; ');
+        console.error(`Error: cannot listen on 127.0.0.1:${port} (${busy}).`);
+        console.error(`Find and stop the process holding the port:  ${portOwnerHint(port)}`);
+        process.exit(1);
+    }
+    for (const { host, error } of listener.failures) {
+        console.error(`WARNING: could not bind ${host}:${port} (${error.code ?? error.message}).`);
+        console.error(`If the consent redirect goes to ${host}, another process will receive the OAuth code instead of this listener.`);
+        console.error(`Check:  ${portOwnerHint(port)}`);
+    }
+    console.log(`Listening for the OAuth callback on ${listener.bound.map((host) => `${host}:${port}`).join(' and ')}`);
 
     return new Promise<void>((resolve, reject) => {
         const authUrl = oauth2Client.generateAuthUrl({
@@ -265,38 +345,15 @@ async function authenticate(scopes: string[]) {
         console.log('Please visit this URL to authenticate:', authUrl);
         open(authUrl);
 
-        server.on('request', async (req, res) => {
-            if (!req.url?.startsWith(callbackUrl.pathname)) return;
-
-            const url = new URL(req.url, callbackUrl.origin);
-            const code = url.searchParams.get('code');
-
-            if (!code) {
-                res.writeHead(400);
-                res.end('No code provided');
-                reject(new Error('No code provided'));
-                return;
-            }
-
-            try {
-                const { tokens } = await oauth2Client.getToken(code);
-                oauth2Client.setCredentials(tokens);
-
-                // Store both tokens and authorized scopes for runtime filtering
-                const credentials = { tokens, scopes };
-                fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(credentials, null, 2), { mode: 0o600 });
-
-                res.writeHead(200);
-                res.end('Authentication successful! You can close this window.');
-                console.log('Credentials saved with scopes:', scopes.join(', '));
-                server.close();
+        callbackHandled
+            .then(async () => {
+                await listener.close();
                 resolve();
-            } catch (error) {
-                res.writeHead(500);
-                res.end('Authentication failed');
-                reject(error);
-            }
-        });
+            })
+            .catch(async (error: unknown) => {
+                await listener.close();
+                reject(error instanceof Error ? error : new Error(String(error)));
+            });
     });
 }
 
@@ -331,6 +388,10 @@ export function createGmailServer(): Server {
 
 // Main function
 async function main() {
+    if (process.argv[2] === 'doctor') {
+        process.exit(await runDoctorCli(process.env));
+    }
+
     await loadCredentials();
 
     if (process.argv[2] === 'auth') {
@@ -373,6 +434,45 @@ async function main() {
 
     const transport = new StdioServerTransport();
     await createGmailServer().connect(transport);
+}
+
+/**
+ * users.threads.list with a query silently omits threads that contain
+ * messages sent by the user (Gmail API quirk), so any thread you replied
+ * to disappears from query-based thread listings. Work around it by
+ * searching messages instead and collecting unique thread IDs in order.
+ */
+async function resolveThreadIdsFromQuery(
+    gmailClient: gmail_v1.Gmail,
+    query: string,
+    maxResults: number,
+): Promise<string[]> {
+    const threadIds: string[] = [];
+    const seen = new Set<string>();
+    let pageToken: string | undefined;
+
+    while (threadIds.length < maxResults) {
+        const response = await gmailClient.users.messages.list({
+            userId: 'me',
+            q: query,
+            maxResults: Math.min(500, Math.max(50, maxResults * 2)),
+            pageToken,
+        });
+
+        for (const message of response.data.messages || []) {
+            const threadId = message.threadId;
+            if (threadId && !seen.has(threadId)) {
+                seen.add(threadId);
+                threadIds.push(threadId);
+                if (threadIds.length >= maxResults) break;
+            }
+        }
+
+        pageToken = response.data.nextPageToken || undefined;
+        if (!pageToken) break;
+    }
+
+    return threadIds;
 }
 
 /**
@@ -431,27 +531,51 @@ function configureGmailServer(server: Server, gmail: gmail_v1.Gmail): Server {
 
                         const threadMessages = threadResponse.data.messages || [];
                         if (threadMessages.length > 0) {
-                            // Collect all Message-ID values for the References chain
+                            // Order by internalDate, NOT by array position.
+                            //
+                            // The array Gmail returns is not reliably chronological, and the
+                            // previous code took threadMessages[length - 1] as the reply
+                            // parent. On a real thread that picked one of our OWN earlier
+                            // sent messages, and a draft anchored to a non-tail parent lists
+                            // in the Drafts panel but never renders inside the conversation.
+                            // That is the recurring "I see it in drafts, I click it, the
+                            // thread has no draft" symptom in
+                            // ArtyMcLabin/PersonalAssistant-ClaudeCode#208.
+                            //
+                            // Messages missing internalDate keep their original relative
+                            // position, so this degrades to the old behaviour rather than
+                            // shuffling anything unpredictably.
+                            const ordered = threadMessages
+                                .map((msg, idx) => ({ msg, idx }))
+                                .sort((a, b) => {
+                                    const da = Number(a.msg.internalDate ?? NaN);
+                                    const db = Number(b.msg.internalDate ?? NaN);
+                                    if (Number.isFinite(da) && Number.isFinite(db) && da !== db) {
+                                        return da - db;
+                                    }
+                                    return a.idx - b.idx;
+                                })
+                                .map((entry) => entry.msg);
+
+                            const messageIdOf = (msg: any): string | undefined =>
+                                (msg?.payload?.headers || []).find(
+                                    (h: any) => h.name?.toLowerCase() === 'message-id'
+                                )?.value ?? undefined;
+
+                            // References chain in chronological order
                             const allMessageIds: string[] = [];
-                            for (const msg of threadMessages) {
-                                const msgHeaders = msg.payload?.headers || [];
-                                const messageIdHeader = msgHeaders.find(
-                                    (h) => h.name?.toLowerCase() === 'message-id'
-                                );
-                                if (messageIdHeader?.value) {
-                                    allMessageIds.push(messageIdHeader.value);
+                            for (const msg of ordered) {
+                                const id = messageIdOf(msg);
+                                if (id) {
+                                    allMessageIds.push(id);
                                 }
                             }
 
-                            // Last message's Message-ID becomes In-Reply-To
-                            const lastMessage = threadMessages[threadMessages.length - 1];
-                            const lastHeaders = lastMessage.payload?.headers || [];
-                            const lastMessageId = lastHeaders.find(
-                                (h) => h.name?.toLowerCase() === 'message-id'
-                            )?.value;
+                            // Newest message's Message-ID becomes In-Reply-To
+                            const newestMessageId = messageIdOf(ordered[ordered.length - 1]);
 
-                            if (lastMessageId) {
-                                validatedArgs.inReplyTo = lastMessageId;
+                            if (newestMessageId) {
+                                validatedArgs.inReplyTo = newestMessageId;
                             }
                             if (allMessageIds.length > 0) {
                                 validatedArgs.references = allMessageIds.join(' ');
@@ -856,6 +980,53 @@ function configureGmailServer(server: Server, gmail: gmail_v1.Gmail): Server {
                             {
                                 type: "text",
                                 text: `Draft ${validatedArgs.draftId} deleted successfully.`,
+                            },
+                        ],
+                    };
+                }
+
+                case "list_drafts": {
+                    const validatedArgs = ListDraftsSchema.parse(args);
+                    const draftsResponse = await gmail.users.drafts.list({
+                        userId: 'me',
+                        maxResults: validatedArgs.maxResults || 50,
+                        q: validatedArgs.query,
+                    });
+
+                    const drafts = draftsResponse.data.drafts || [];
+
+                    // drafts.list only returns draft id + message {id, threadId}; fetch
+                    // metadata per draft so each entry is identifiable by subject/To/snippet.
+                    const draftDetails = await Promise.all(
+                        drafts.map(async (draft) => {
+                            const detail = await gmail.users.drafts.get({
+                                userId: 'me',
+                                id: draft.id!,
+                                format: 'metadata',
+                            });
+
+                            const message = detail.data.message;
+                            const headers = message?.payload?.headers || [];
+
+                            return {
+                                draftId: draft.id || '',
+                                messageId: message?.id || '',
+                                threadId: message?.threadId || '',
+                                subject: headers.find(h => h.name === 'Subject')?.value || '',
+                                to: headers.find(h => h.name === 'To')?.value || '',
+                                snippet: message?.snippet || '',
+                            };
+                        })
+                    );
+
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: JSON.stringify({
+                                    resultCount: draftDetails.length,
+                                    drafts: draftDetails,
+                                }, null, 2),
                             },
                         ],
                     };
@@ -1343,7 +1514,7 @@ function configureGmailServer(server: Server, gmail: gmail_v1.Gmail): Server {
                             // Find the attachment part to get original filename
                             const findAttachment = (part: any): string | null => {
                                 if (part.body && part.body.attachmentId === validatedArgs.attachmentId) {
-                                    return part.filename || `attachment-${validatedArgs.attachmentId}`;
+                                    return part.filename || fallbackAttachmentName(validatedArgs.attachmentId);
                                 }
                                 if (part.parts) {
                                     for (const subpart of part.parts) {
@@ -1354,11 +1525,11 @@ function configureGmailServer(server: Server, gmail: gmail_v1.Gmail): Server {
                                 return null;
                             };
 
-                            filename = findAttachment(messageResponse.data.payload) || `attachment-${validatedArgs.attachmentId}`;
+                            filename = findAttachment(messageResponse.data.payload) || fallbackAttachmentName(validatedArgs.attachmentId);
                         }
 
                         // Sanitize filename to prevent path traversal
-                        filename = path.basename(filename);
+                        filename = sanitizeFilename(filename);
 
                         // Ensure save directory exists
                         if (!fs.existsSync(savePath)) {
@@ -1475,13 +1646,17 @@ function configureGmailServer(server: Server, gmail: gmail_v1.Gmail): Server {
 
                 case "list_inbox_threads": {
                     const validatedArgs = ListInboxThreadsSchema.parse(args);
-                    const threadsResponse = await gmail.users.threads.list({
-                        userId: 'me',
-                        q: validatedArgs.query || 'in:inbox',
-                        maxResults: validatedArgs.maxResults || 50,
-                    });
+                    // Resolve thread IDs via messages.list: users.threads.list with a
+                    // query silently drops threads that contain messages sent by the
+                    // user (e.g. any thread you replied to), so we search messages
+                    // instead and group them by thread.
+                    const threadIds = await resolveThreadIdsFromQuery(
+                        gmail,
+                        validatedArgs.query || 'in:inbox',
+                        validatedArgs.maxResults || 50,
+                    );
 
-                    const threads = threadsResponse.data.threads || [];
+                    const threads = threadIds.map(id => ({ id, snippet: '', historyId: '' }));
 
                     // Fetch metadata for each thread to get message count and latest message info
                     const threadDetails = await Promise.all(
@@ -1499,8 +1674,8 @@ function configureGmailServer(server: Server, gmail: gmail_v1.Gmail): Server {
 
                             return {
                                 threadId: thread.id || '',
-                                snippet: thread.snippet || '',
-                                historyId: thread.historyId || '',
+                                snippet: detail.data.snippet || '',
+                                historyId: detail.data.historyId || '',
                                 messageCount: messages.length,
                                 latestMessage: {
                                     from: latestHeaders.find(h => h.name === 'From')?.value || '',
@@ -1526,13 +1701,14 @@ function configureGmailServer(server: Server, gmail: gmail_v1.Gmail): Server {
 
                 case "get_inbox_with_threads": {
                     const validatedArgs = GetInboxWithThreadsSchema.parse(args);
-                    const threadsResponse = await gmail.users.threads.list({
-                        userId: 'me',
-                        q: validatedArgs.query || 'in:inbox',
-                        maxResults: validatedArgs.maxResults || 50,
-                    });
+                    // Same threads.list quirk as list_inbox_threads: resolve via messages.list.
+                    const threadIds = await resolveThreadIdsFromQuery(
+                        gmail,
+                        validatedArgs.query || 'in:inbox',
+                        validatedArgs.maxResults || 50,
+                    );
 
-                    const threads = threadsResponse.data.threads || [];
+                    const threads = threadIds.map(id => ({ id, snippet: '', historyId: '' }));
 
                     if (!validatedArgs.expandThreads) {
                         // Return basic thread list without expansion (same as list_inbox_threads)
@@ -1551,8 +1727,8 @@ function configureGmailServer(server: Server, gmail: gmail_v1.Gmail): Server {
 
                                 return {
                                     threadId: thread.id || '',
-                                    snippet: thread.snippet || '',
-                                    historyId: thread.historyId || '',
+                                    snippet: detail.data.snippet || '',
+                                    historyId: detail.data.historyId || '',
                                     messageCount: messages.length,
                                     latestMessage: {
                                         from: latestHeaders.find(h => h.name === 'From')?.value || '',
@@ -1725,6 +1901,84 @@ function configureGmailServer(server: Server, gmail: gmail_v1.Gmail): Server {
                             {
                                 type: "text",
                                 text: `Reply-all sent successfully!\nTo: ${replyTo.join(', ')}${replyCc.length > 0 ? `\nCC: ${replyCc.join(', ')}` : ''}\nSubject: ${replySubject}\nThread ID: ${threadId}`,
+                            },
+                        ],
+                    };
+                }
+
+                case "forward_email": {
+                    const validatedArgs = ForwardEmailSchema.parse(args);
+
+                    // Fetch the original email: headers, bodies, and the MIME
+                    // tree needed to locate attachment parts.
+                    const originalEmail = await gmail.users.messages.get({
+                        userId: 'me',
+                        id: validatedArgs.messageId,
+                        format: 'full',
+                    });
+
+                    const payload = originalEmail.data.payload;
+                    const { subject, from, to, cc, date } = extractHeaders(payload);
+                    const { text: originalText, html: originalHtml } = extractEmailContent(
+                        payload as GmailMessagePart || {}
+                    );
+
+                    const headerFields = { from, date, subject, to, cc: cc || undefined };
+
+                    // Carry attachments and inline images over unless opted out.
+                    const rawAttachments: Array<Record<string, unknown>> = [];
+                    if (validatedArgs.includeAttachments) {
+                        const refs = collectForwardAttachments(payload);
+                        assertForwardAttachmentsWithinLimit(refs);
+
+                        for (const ref of refs) {
+                            const attachment = await gmail.users.messages.attachments.get({
+                                userId: 'me',
+                                messageId: validatedArgs.messageId,
+                                id: ref.attachmentId,
+                            });
+
+                            const data = attachment.data.data;
+                            if (!data) continue;
+
+                            rawAttachments.push({
+                                filename: ref.filename,
+                                // Gmail returns base64url; nodemailer expects standard base64.
+                                content: data.replace(/-/g, '+').replace(/_/g, '/'),
+                                contentType: ref.mimeType,
+                                ...(ref.cid ? { cid: ref.cid } : {}),
+                            });
+                        }
+                    }
+
+                    // Mirror whatever the original message had: an HTML original
+                    // is forwarded as HTML so its formatting and any inline
+                    // images survive, otherwise plain text.
+                    const hasHtml = Boolean(originalHtml);
+                    const emailArgs = {
+                        to: validatedArgs.to,
+                        cc: validatedArgs.cc,
+                        bcc: validatedArgs.bcc,
+                        from: validatedArgs.from,
+                        subject: addFwdPrefix(subject),
+                        body: buildForwardedTextBody(headerFields, originalText, validatedArgs.body),
+                        htmlBody: hasHtml
+                            ? buildForwardedHtmlBody(headerFields, originalHtml, validatedArgs.htmlBody)
+                            : undefined,
+                        mimeType: hasHtml ? 'multipart/alternative' : 'text/plain',
+                        rawAttachments,
+                        // Deliberately no threadId / inReplyTo: a forward starts a
+                        // new conversation with the new recipients rather than
+                        // appending to the original thread.
+                    };
+
+                    await handleEmailAction("send", emailArgs);
+
+                    return {
+                        content: [
+                            {
+                                type: "text",
+                                text: `Email forwarded successfully!\nTo: ${validatedArgs.to.join(', ')}${validatedArgs.cc?.length ? `\nCC: ${validatedArgs.cc.join(', ')}` : ''}\nSubject: ${addFwdPrefix(subject)}\nAttachments carried over: ${rawAttachments.length}`,
                             },
                         ],
                     };

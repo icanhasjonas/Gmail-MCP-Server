@@ -33,7 +33,7 @@ There's a downstream fork that took this in the **maximalist** direction. I'm no
 - **Thread-level tools** - `get_thread`, `list_inbox_threads`, `get_inbox_with_threads`, `modify_thread` for efficient thread-based email operations in a single call
 - **CC/BCC visibility** - `read_email` now shows CC and BCC headers when present ([PR #21](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/21) by [@panghy](https://github.com/panghy))
 - **Phishing report tools** - `report_phishing` and `batch_report_phishing` for marking messages as spam via the Gmail API ([PR #24](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/24) by [@ShivamB25](https://github.com/ShivamB25))
-- **Draft lifecycle tools** - `send_draft`, `delete_draft`, `update_draft` close the orphan-draft gap: `send_draft` atomically sends an existing draft and removes it from Drafts (no ghost copy); `update_draft` mutates a draft in place preserving its ID (no draft pile-up across iteration loops); `delete_draft` discards an abandoned draft ([PR #30](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/30) by [@thisisambros](https://github.com/thisisambros))
+- **Draft lifecycle tools** - `list_drafts`, `send_draft`, `delete_draft`, `update_draft` close the orphan-draft gap: `list_drafts` discovers existing drafts and their IDs (needed by the other draft tools for drafts not created in the current session); `send_draft` atomically sends an existing draft and removes it from Drafts (no ghost copy); `update_draft` mutates a draft in place preserving its ID (no draft pile-up across iteration loops); `delete_draft` discards an abandoned draft ([PR #30](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/30) by [@thisisambros](https://github.com/thisisambros))
 - **Tool annotations** - MCP spec annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`) on all tools for safer LLM tool execution ([PR #14](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/14) by [@bryankthompson](https://github.com/bryankthompson))
 - **Download email tool** - `download_email` saves emails to disk in json/eml/txt/html formats without consuming LLM context ([PR #13](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/13) by [@icanhasjonas](https://github.com/icanhasjonas))
 - **Durable OAuth sessions** - `refresh_token` is persisted across restarts, ending the hourly re-auth loop ([PR #35](https://github.com/ArtyMcLabin/Gmail-MCP-Server/pull/35) by [@BrentBaccala](https://github.com/BrentBaccala))
@@ -288,7 +288,8 @@ The server automatically filters available tools based on your authorized scopes
 |-------|---------------------|
 | `read_email`, `search_emails`, `download_attachment` | `gmail.readonly` or `gmail.modify` |
 | `list_email_labels` | `gmail.readonly`, `gmail.modify`, or `gmail.labels` |
-| `send_email`, `draft_email`, `reply_all`, `send_draft` | `gmail.modify`, `gmail.compose`, or `gmail.send` |
+| `list_drafts` | `gmail.readonly`, `gmail.modify`, or `gmail.compose` |
+| `send_email`, `draft_email`, `reply_all`, `forward_email`, `send_draft` | `gmail.modify`, `gmail.compose`, or `gmail.send` |
 | `delete_draft`, `update_draft` | `gmail.modify` or `gmail.compose` |
 | `modify_email`, `batch_modify_emails`, `modify_thread`, `report_phishing`, `batch_report_phishing` | `gmail.modify` |
 | `delete_email`, `batch_delete_emails` | `gmail.full` (`https://mail.google.com/`) |
@@ -492,6 +493,23 @@ claude mcp add gmail-info -s user \
 Tools then surface as `mcp__gmail-personal__personal_search_emails`, `mcp__gmail-info__info_search_emails`, etc. - distinct at every layer. The dispatch handler strips the prefix and looks up the resolved name via `getToolByName`; only strips when the result is a known tool (so a prefix value that overlaps a real tool name cannot cause silent mis-dispatch).
 
 The `auth` subcommand runs before the server starts and is unaffected - invoke it without `--tool-prefix`.
+
+### Checking token health: the `doctor` subcommand
+
+`doctor` diagnoses the stored OAuth tokens without starting the server or opening a browser. It verifies the credentials and keys files exist, that a refresh token is stored, and exchanges the refresh grant with Google to confirm the account is still authorized. Exit code `0` means healthy, `1` means the account needs a browser re-consent (scriptable for cron checks):
+
+```bash
+npx @artymclabin/gmail-mcp doctor
+
+# per-account, matching how the server was configured
+GMAIL_CREDENTIALS_PATH=$HOME/.gmail-mcp/credentials-personal.json \
+GMAIL_OAUTH_PATH=$HOME/.gmail-mcp/gcp-oauth.keys.json \
+npx @artymclabin/gmail-mcp doctor
+```
+
+Why a refresh token can die even though the server never restarted: unverified OAuth apps get seven-day refresh tokens, and password changes or manual revocations kill them sooner. When `doctor` reports `invalid_grant`, re-run `auth` to re-consent, then **restart the MCP clients** - servers started before the re-auth keep the old refresh token in memory and keep failing until respawned.
+
+The `auth` callback also listens on every loopback stack (`127.0.0.1` and `::1`). Browsers resolve `localhost` to `::1` first, so a `127.0.0.1`-only listener silently loses the consent redirect to whichever process owns `[::1]:3000`; `auth` now warns loudly when a stack is busy and names the `lsof` command to find the blocker.
 
 ## Available Tools
 
@@ -876,9 +894,20 @@ Discards an abandoned draft via `users.drafts.delete`.
 }
 ```
 
+### 27. List Drafts (`list_drafts`)
+Lists existing drafts via `users.drafts.list` and returns each draft's `draftId` alongside its `messageId`, `threadId`, `subject`, `to` and `snippet`. Because `drafts.list` returns only draft/message IDs, each draft is fetched with `users.drafts.get` (`format: 'metadata'`) to populate those fields. This is how you obtain the `draftId` required by `send_draft`, `update_draft` and `delete_draft` for drafts that were **not** created in the current session (e.g. drafts written in the Gmail UI or a previous run). Accepts an optional `maxResults` (default 50) and an optional Gmail `query` to filter drafts.
+
+```json
+{
+  "maxResults": 20,
+  "query": "subject:invoice"
+}
+```
+
 #### Canonical draft lifecycle
 
 ```
+list_drafts()                  // discover draftIds not created this session
 draft_email(...) → draftId
   ↓ (user wants changes)
 update_draft(draftId, ...)   // mutate in place, same ID
@@ -887,6 +916,46 @@ send_draft(draftId)          // atomic send + draft removal
 ```
 
 Or abort: `delete_draft(draftId)`.
+
+### 28. Forward Email (`forward_email`)
+Forwards an existing email to new recipients. Fetches the original message, prepends the standard `---------- Forwarded message ----------` header block, and carries attachments and inline images over by default.
+
+**How it works:**
+1. Fetches the original email by `messageId`
+2. Prefixes the subject with `Fwd:` (skipped when it already starts with `Fwd:` or `Fw:`, so chained forwards don't stack)
+3. Quotes the original From/Date/Subject/To/Cc above the original body
+4. Re-attaches every attachment part; inline images keep their `Content-ID` so `cid:` references in the quoted HTML still resolve
+5. Sends via the existing `send_email` pipeline
+
+A forward starts a new conversation rather than appending to the original thread, so no `threadId` or `In-Reply-To` is set.
+
+```json
+{
+  "messageId": "182ab45cd67ef",
+  "to": ["colleague@example.com"],
+  "body": "FYI - the invoice we discussed."
+}
+```
+
+**Without attachments** (useful when the original carries a large payload):
+```json
+{
+  "messageId": "182ab45cd67ef",
+  "to": ["colleague@example.com"],
+  "includeAttachments": false
+}
+```
+
+Parameters:
+- `messageId` (required): ID of the email to forward
+- `to` (required): List of recipient email addresses
+- `cc`, `bcc` (optional): Additional recipients
+- `from` (optional): Send-as alias
+- `body` (optional): Note placed above the quoted original
+- `htmlBody` (optional): HTML version of that note; only used when the original has an HTML body
+- `includeAttachments` (optional, default `true`): Carry the original's attachments and inline images over
+
+Attachments are buffered in memory while the message is assembled, so the combined size is capped at 25 MB (Gmail's own send ceiling). Above that the tool fails with a clear error rather than an opaque API rejection; use `includeAttachments: false` to forward the text alone.
 
 ## Filter Management Features
 
